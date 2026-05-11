@@ -1,0 +1,111 @@
+name: IOC Malware Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: IOC Malware Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed files
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" > /tmp/changed_files.txt
+          else
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              # First push on a new branch — scan just the tip commit
+              git diff-tree --no-commit-id -r --name-only "${{ github.sha }}" > /tmp/changed_files.txt
+            else
+              git diff --name-only "$BEFORE" "${{ github.sha }}" > /tmp/changed_files.txt
+            fi
+          fi
+          echo "Files to scan:"
+          cat /tmp/changed_files.txt
+
+      - name: Run IOC scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Exclude this workflow file and malware response docs from the scan
+          EXCLUDE_PATTERN='^\.github/workflows/ioc-scan\.yml$|[Mm]alware|[Ii]ncident'
+
+          # 13 IOC signatures — Lazarus Group / Contagious Interview malware family
+          IOC_STRINGS=(
+            '_$_1e42'
+            "global['!']='9-3925-8'"
+            "global['_V']='A"
+            'api.trongrid.io'
+            'bsc-dataseed.binance.org'
+            'bsc-rpc.publicnode.com'
+            'TMfKQEd7TJJa5xNZJZ2Lep838vrzrs7mAP'
+            'TXfxHUet9pJVU1BgVkBAbrES4YUc1nGzcG'
+            '166.88.54.158'
+            'setup_bun.js'
+            'bun_environment.js'
+            'exec(Request._code)'
+            'Shai-Hulud'
+          )
+
+          abort=0
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            echo "$file" | grep -qE "$EXCLUDE_PATTERN" && continue
+            [[ -f "$file" ]] || continue  # skip deleted files
+
+            # Check 1: IOC pattern scan (fixed-string, no regex false positives)
+            for ioc in "${IOC_STRINGS[@]}"; do
+              if grep -qF -- "$ioc" "$file" 2>/dev/null; then
+                echo "::error file=${file}::IOC matched: ${ioc}"
+                abort=1
+              fi
+            done
+
+            # Check 2: postcss.config.* size (clean ~83 B, infected ~5382 B)
+            case "$(basename "$file")" in
+              postcss.config.*)
+                size=$(wc -c < "$file" | tr -d ' ')
+                if (( size > 1000 )); then
+                  echo "::error file=${file}::Oversized postcss config: ${size} bytes (clean ~83 B, infected ~5382 B)"
+                  abort=1
+                fi
+                ;;
+            esac
+
+            # Check 3: long-line in framework configs (payload is one extremely long line)
+            case "$(basename "$file")" in
+              next.config.*|vite.config.*|tailwind.config.*|webpack.config.*)
+                max_len=$(awk '{ if (length > m) m = length } END { print m+0 }' "$file")
+                if (( max_len > 500 )); then
+                  echo "::error file=${file}::Line too long: ${max_len} chars (limit 500; malware is injected as a single long line)"
+                  abort=1
+                fi
+                ;;
+            esac
+
+          done < /tmp/changed_files.txt
+
+          if (( abort )); then
+            echo ""
+            echo "🚫 IOC scan FAILED — Lazarus Group / Contagious Interview signatures detected."
+            echo "   Remove the malicious payload and verify file integrity before merging."
+            exit 1
+          fi
+
+          echo "✅ IOC scan passed — no malware signatures detected."
